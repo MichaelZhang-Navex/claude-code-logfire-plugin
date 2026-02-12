@@ -10,9 +10,50 @@ set -euo pipefail
 
 LOG_DIR="${CLAUDE_PROJECT_DIR:-.}/.claude/logs"
 LOG_FILE="$LOG_DIR/session-events.jsonl"
+DIAG_LOG="$LOG_DIR/diagnostics.jsonl"
 mkdir -p "$LOG_DIR"
 
+# --- Diagnostics -----------------------------------------------------------
+
+log_diag() {
+  local level="$1" msg="$2"
+  shift 2
+  local extra=""
+  if [ $# -gt 0 ]; then
+    extra="$1"
+  fi
+  local ts
+  ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local event="${_HOOK_EVENT:-unknown}"
+  local sid="${_SESSION_ID:-unknown}"
+  if [ -n "$extra" ]; then
+    jq -n -c \
+      --arg ts "$ts" --arg level "$level" --arg msg "$msg" \
+      --arg event "$event" --arg sid "$sid" --arg extra "$extra" \
+      '{timestamp:$ts, level:$level, hook_event:$event, session_id:$sid, message:$msg, detail:$extra}' \
+      >> "$DIAG_LOG" 2>/dev/null || true
+  else
+    jq -n -c \
+      --arg ts "$ts" --arg level "$level" --arg msg "$msg" \
+      --arg event "$event" --arg sid "$sid" \
+      '{timestamp:$ts, level:$level, hook_event:$event, session_id:$sid, message:$msg}' \
+      >> "$DIAG_LOG" 2>/dev/null || true
+  fi
+}
+
+trap 'log_diag "error" "Unexpected failure at line $LINENO" "${BASH_COMMAND:-unknown}"' ERR
+
 input=$(cat)
+
+# Stash event/session early for diagnostics context
+_HOOK_EVENT=$(echo "$input" | jq -r '.hook_event_name // "unknown"' 2>/dev/null || echo "parse_error")
+_SESSION_ID=$(echo "$input" | jq -r '.session_id // "unknown"' 2>/dev/null || echo "parse_error")
+
+if [ "$_HOOK_EVENT" = "parse_error" ] || [ "$_SESSION_ID" = "parse_error" ]; then
+  log_diag "error" "Failed to parse hook input JSON" "${input:0:500}"
+  exit 1
+fi
+
 # macOS date doesn't support %N; detect by checking for literal 'N' in output
 timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
 if [[ "$timestamp" == *N* ]]; then
@@ -20,7 +61,9 @@ if [[ "$timestamp" == *N* ]]; then
 fi
 
 # --- JSONL logging (always) ------------------------------------------------
-echo "$input" | jq -c --arg ts "$timestamp" '. + {captured_at: $ts}' >> "$LOG_FILE"
+if ! echo "$input" | jq -c --arg ts "$timestamp" '. + {captured_at: $ts}' >> "$LOG_FILE" 2>/dev/null; then
+  log_diag "error" "Failed to write JSONL log entry"
+fi
 
 # --- OTel via Logfire (if token set) ---------------------------------------
 LOGFIRE_TOKEN="${LOGFIRE_TOKEN:-}"
@@ -55,11 +98,18 @@ trace_id_from_session() {
 
 send_otlp() {
   local payload="$1"
-  curl -s --max-time 5 \
+  local http_code
+  http_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
     -X POST "$OTLP_ENDPOINT" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $LOGFIRE_TOKEN" \
-    -d "$payload" >/dev/null 2>&1 || true
+    -d "$payload" 2>/dev/null) || {
+    log_diag "warn" "curl failed (network/timeout)"
+    return 0
+  }
+  if [ "$http_code" -ge 400 ] 2>/dev/null; then
+    log_diag "warn" "OTLP export failed" "http_status=$http_code"
+  fi
 }
 
 build_otlp_payload() {
@@ -83,7 +133,7 @@ build_otlp_payload() {
           ]
         },
         scopeSpans: [{
-          scope: {name: "logfire-session-capture", version: "0.2.0"},
+          scope: {name: "claude-code-logfire", version: "0.2.0"},
           spans: [{
             traceId: $traceId,
             spanId: $spanId,
@@ -110,12 +160,20 @@ make_int_attr() {
   jq -n -c --arg k "$key" --arg v "$val" '{key:$k, value:{intValue:$v}}'
 }
 
+make_double_attr() {
+  local key="$1" val="$2"
+  jq -n -c --arg k "$key" --argjson v "$val" '{key:$k, value:{doubleValue:$v}}'
+}
+
 # --- Extract fields from input ---------------------------------------------
 
 hook_event=$(echo "$input" | jq -r '.hook_event_name // empty')
 session_id=$(echo "$input" | jq -r '.session_id // empty')
 
-[ -z "$hook_event" ] || [ -z "$session_id" ] && exit 0
+if [ -z "$hook_event" ] || [ -z "$session_id" ]; then
+  log_diag "warn" "Missing hook_event or session_id, skipping OTel export"
+  exit 0
+fi
 
 trace_id=$(trace_id_from_session "$session_id")
 ts_nano=$(now_nano)
@@ -126,45 +184,122 @@ STATE_FILE="${TMPDIR:-/tmp}/claude-logfire-${session_id}.json"
 # Helper: read parent span ID from state file
 read_root_span_id() {
   if [ -f "$STATE_FILE" ]; then
-    jq -r '.root_span_id' "$STATE_FILE"
+    local rid
+    rid=$(jq -r '.root_span_id // empty' "$STATE_FILE" 2>/dev/null)
+    if [ -z "$rid" ]; then
+      log_diag "warn" "State file exists but root_span_id is empty" "$STATE_FILE"
+    fi
+    echo "$rid"
   else
+    log_diag "warn" "State file missing, no root_span_id available (SessionStart may not have fired)" "$STATE_FILE"
     echo ""
   fi
 }
 
-# Helper: extract last assistant response from new transcript lines
-# Uses last_line tracking (a la LangChain) to read only new lines since last invocation
-extract_assistant_response() {
+# Helper: persist transcript offset in state file
+update_state_last_line() {
+  local new_last_line="$1"
+  if [ -z "$new_last_line" ] || [ ! -f "$STATE_FILE" ]; then
+    return 0
+  fi
+  if ! jq -c --arg ll "$new_last_line" '.last_line = ($ll | tonumber)' "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null; then
+    log_diag "error" "Failed to update last_line in state file"
+  else
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  fi
+}
+
+# Helper: extract last assistant response, usage, and model from new transcript lines.
+# Returns a JSON object: {response, usage, model} in one pass to avoid reading twice.
+extract_transcript_data() {
   local tp="$1"
-  [ -z "$tp" ] || [ ! -f "$tp" ] && return
+  if [ -z "$tp" ]; then
+    log_diag "warn" "No transcript_path provided for transcript extraction"
+    echo '{}'
+    return 0
+  fi
+  if [ ! -f "$tp" ]; then
+    log_diag "warn" "Transcript file does not exist" "$tp"
+    echo '{}'
+    return 0
+  fi
 
   local last_line=0
   if [ -f "$STATE_FILE" ]; then
-    last_line=$(jq -r '.last_line // 0' "$STATE_FILE")
+    last_line=$(jq -r '.last_line // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+  else
+    log_diag "warn" "State file missing during transcript extraction, reading from line 0"
   fi
 
-  local new_lines
-  new_lines=$(awk -v start="$last_line" 'NR > start && NF' "$tp" 2>/dev/null || true)
+  # Stop events can fire a moment before transcript lines are flushed.
+  # Retry briefly so the first assistant response is not missed.
+  local max_attempts="${TRANSCRIPT_READ_RETRIES:-20}"
+  local retry_delay_s="${TRANSCRIPT_READ_DELAY_SECONDS:-0.1}"
+  local attempt=0
 
-  # Update last_line in state file
-  local total_lines
-  total_lines=$(wc -l < "$tp" 2>/dev/null | tr -d ' ')
-  if [ -f "$STATE_FILE" ]; then
-    local updated_state
-    updated_state=$(jq -c --arg ll "$total_lines" '.last_line = ($ll | tonumber)' "$STATE_FILE")
-    echo "$updated_state" > "$STATE_FILE"
-  fi
+  while [ "$attempt" -le "$max_attempts" ]; do
+    local total_lines
+    total_lines=$(wc -l < "$tp" 2>/dev/null | tr -d ' ')
 
-  [ -z "$new_lines" ] && return
+    if [ "$total_lines" -le "$last_line" ]; then
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        sleep "$retry_delay_s"
+        attempt=$((attempt + 1))
+        continue
+      fi
+      log_diag "info" "No new transcript lines since last read" "last_line=$last_line total_lines=$total_lines"
+      echo '{}'
+      return 0
+    fi
 
-  # Find last assistant text response from the new lines
-  local last_assistant_line
-  last_assistant_line=$(echo "$new_lines" | grep '"type": *"assistant"' 2>/dev/null | tail -1 || true)
-  [ -z "$last_assistant_line" ] && return
+    local start_line=$((last_line + 1))
 
-  echo "$last_assistant_line" \
-    | jq -r '[.message.content[]? | select(.type=="text") | .text] | join("\n")' 2>/dev/null \
-    | head -c 10000 || true
+    # Parse only complete lines to avoid transient parse failures during concurrent writes.
+    local result
+    result=$(sed -n "${start_line},${total_lines}p" "$tp" 2>/dev/null \
+      | jq -s -c '
+          ([.[] | select(.type=="assistant")] | last) as $msg |
+          if $msg == null then
+            {found:false}
+          else
+            {
+              found:true,
+              response: ([$msg.message.content[]? | select(.type=="text") | .text] | join("\n") | .[0:10000]),
+              usage: ($msg.message.usage // null),
+              model: ($msg.message.model // null)
+            }
+          end
+        ' 2>/dev/null) || {
+      if [ "$attempt" -lt "$max_attempts" ]; then
+        sleep "$retry_delay_s"
+        attempt=$((attempt + 1))
+        continue
+      fi
+      log_diag "error" "jq/sed pipeline failed during transcript extraction" "last_line=$last_line total_lines=$total_lines file=$tp"
+      echo '{}'
+      return 0
+    }
+
+    # Advance transcript offset only after a successful parse.
+    update_state_last_line "$total_lines"
+
+    if [ "$(echo "$result" | jq -r '.found // false' 2>/dev/null)" = "true" ]; then
+      echo "$result" | jq -c 'del(.found)'
+      return 0
+    fi
+
+    # No assistant line in this slice yet; keep waiting briefly for it to appear.
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      last_line="$total_lines"
+      sleep "$retry_delay_s"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    log_diag "info" "No assistant data found in new transcript lines" "last_line=$last_line total_lines=$total_lines"
+    echo '{}'
+    return 0
+  done
 }
 
 # --- Build span attributes per event type ----------------------------------
@@ -176,34 +311,63 @@ case "$hook_event" in
     model=$(echo "$input" | jq -r '.model // empty')
     source=$(echo "$input" | jq -r '.source // empty')
 
+    # Capture user and terminal info from environment
+    term_type="${TERM:-}"
+    term_program="${TERM_PROGRAM:-}"
+    term_program_version="${TERM_PROGRAM_VERSION:-}"
+    shell_name="${SHELL:-}"
+    tty_device=$(tty 2>/dev/null || echo "")
+    [ "$tty_device" = "not a tty" ] && tty_device=""
+
     # Snapshot current transcript length so we only read new lines on subsequent hooks
     initial_line=0
     if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
       initial_line=$(wc -l < "$transcript_path" | tr -d ' ')
     fi
 
-    # Persist state for subsequent hooks
+    # Persist state for subsequent hooks (including user/terminal info for root span)
     jq -n -c \
       --arg root_span_id "$root_span_id" \
       --arg start_time "$ts_nano" \
       --arg cwd "$cwd" \
       --arg model "$model" \
+      --arg term_program "$term_program" \
       --argjson last_line "$initial_line" \
-      '{root_span_id:$root_span_id, start_time:$start_time, cwd:$cwd, model:$model, last_line:$last_line}' \
+      '{root_span_id:$root_span_id, start_time:$start_time, cwd:$cwd, model:$model, term_program:$term_program, last_line:$last_line}' \
       > "$STATE_FILE"
 
     attrs="[$(make_attr "hook.event" "$hook_event")"
     attrs="$attrs,$(make_attr "session.id" "$session_id")"
-    attrs="$attrs,$(make_attr "logfire.msg" "SessionStart")"
+    attrs="$attrs,$(make_attr "logfire.msg" "session started")"
     attrs="$attrs,$(make_attr "logfire.span_type" "span")"
     [ -n "$cwd" ] && attrs="$attrs,$(make_attr "session.cwd" "$cwd")"
     [ -n "$model" ] && attrs="$attrs,$(make_attr "session.model" "$model")"
     [ -n "$source" ] && attrs="$attrs,$(make_attr "session.source" "$source")"
+    [ -n "$term_type" ] && attrs="$attrs,$(make_attr "terminal.type" "$term_type")"
+    [ -n "$term_program" ] && attrs="$attrs,$(make_attr "terminal.program" "$term_program")"
+    [ -n "$term_program_version" ] && attrs="$attrs,$(make_attr "terminal.program_version" "$term_program_version")"
+    [ -n "$shell_name" ] && attrs="$attrs,$(make_attr "user.shell" "$shell_name")"
+    [ -n "$tty_device" ] && attrs="$attrs,$(make_attr "terminal.tty" "$tty_device")"
     attrs="$attrs]"
 
     span_id=$(random_span_id)
-    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "SessionStart" "$ts_nano" "$ts_nano" "$attrs")
+    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "session started" "$ts_nano" "$ts_nano" "$attrs")
     send_otlp "$payload"
+
+    # Pending span for the root session span (enables Logfire Live View)
+    pending_attrs="[$(make_attr "hook.event" "session")"
+    pending_attrs="$pending_attrs,$(make_attr "session.id" "$session_id")"
+    pending_attrs="$pending_attrs,$(make_attr "logfire.msg" "claude-code-session")"
+    pending_attrs="$pending_attrs,$(make_attr "logfire.span_type" "pending_span")"
+    pending_attrs="$pending_attrs,$(make_attr "logfire.pending_parent_id" "0000000000000000")"
+    [ -n "$cwd" ] && pending_attrs="$pending_attrs,$(make_attr "session.cwd" "$cwd")"
+    [ -n "$model" ] && pending_attrs="$pending_attrs,$(make_attr "session.model" "$model")"
+    [ -n "$term_program" ] && pending_attrs="$pending_attrs,$(make_attr "terminal.program" "$term_program")"
+    pending_attrs="$pending_attrs]"
+
+    pending_span_id=$(random_span_id)
+    pending_payload=$(build_otlp_payload "$trace_id" "$pending_span_id" "$root_span_id" "claude-code-session" "$ts_nano" "$ts_nano" "$pending_attrs")
+    send_otlp "$pending_payload"
     ;;
 
   SessionEnd)
@@ -215,22 +379,25 @@ case "$hook_event" in
       start_time=$(echo "$state" | jq -r '.start_time')
       cwd=$(echo "$state" | jq -r '.cwd // empty')
       model=$(echo "$state" | jq -r '.model // empty')
+      term_program=$(echo "$state" | jq -r '.term_program // empty')
     else
+      log_diag "warn" "SessionEnd without state file (no matching SessionStart), using synthetic root span"
       root_span_id=$(random_span_id)
       start_time="$ts_nano"
       cwd=""
       model=""
+      term_program=""
     fi
 
     child_attrs="[$(make_attr "hook.event" "$hook_event")"
     child_attrs="$child_attrs,$(make_attr "session.id" "$session_id")"
-    child_attrs="$child_attrs,$(make_attr "logfire.msg" "SessionEnd")"
+    child_attrs="$child_attrs,$(make_attr "logfire.msg" "session ended")"
     child_attrs="$child_attrs,$(make_attr "logfire.span_type" "span")"
     [ -n "$end_reason" ] && child_attrs="$child_attrs,$(make_attr "session.end_reason" "$end_reason")"
     child_attrs="$child_attrs]"
 
     child_span_id=$(random_span_id)
-    child_payload=$(build_otlp_payload "$trace_id" "$child_span_id" "$root_span_id" "SessionEnd" "$ts_nano" "$ts_nano" "$child_attrs")
+    child_payload=$(build_otlp_payload "$trace_id" "$child_span_id" "$root_span_id" "session ended" "$ts_nano" "$ts_nano" "$child_attrs")
     send_otlp "$child_payload"
 
     # Root span covering entire session
@@ -241,6 +408,7 @@ case "$hook_event" in
     [ -n "$cwd" ] && root_attrs="$root_attrs,$(make_attr "session.cwd" "$cwd")"
     [ -n "$model" ] && root_attrs="$root_attrs,$(make_attr "session.model" "$model")"
     [ -n "$end_reason" ] && root_attrs="$root_attrs,$(make_attr "session.end_reason" "$end_reason")"
+    [ -n "$term_program" ] && root_attrs="$root_attrs,$(make_attr "terminal.program" "$term_program")"
     root_attrs="$root_attrs]"
 
     root_payload=$(build_otlp_payload "$trace_id" "$root_span_id" "" "claude-code-session" "$start_time" "$ts_nano" "$root_attrs")
@@ -253,33 +421,36 @@ case "$hook_event" in
     root_span_id=$(read_root_span_id)
     prompt=$(echo "$input" | jq -r '.prompt // empty')
 
-    logfire_msg="UserPromptSubmit"
-    [ -n "$prompt" ] && logfire_msg="UserPromptSubmit: ${prompt:0:200}"
-
     attrs="[$(make_attr "hook.event" "$hook_event")"
     attrs="$attrs,$(make_attr "session.id" "$session_id")"
-    attrs="$attrs,$(make_attr "logfire.msg" "$logfire_msg")"
+    attrs="$attrs,$(make_attr "logfire.msg" "user prompt")"
     attrs="$attrs,$(make_attr "logfire.span_type" "span")"
     [ -n "$prompt" ] && attrs="$attrs,$(make_attr "user.prompt" "$prompt")"
     attrs="$attrs]"
 
     span_id=$(random_span_id)
-    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "UserPromptSubmit" "$ts_nano" "$ts_nano" "$attrs")
+    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "user prompt" "$ts_nano" "$ts_nano" "$attrs")
     send_otlp "$payload"
     ;;
 
   Stop|SubagentStop)
     root_span_id=$(read_root_span_id)
 
-    # Extract assistant response from transcript
-    response=$(extract_assistant_response "$transcript_path")
+    # Extract response, usage, and model from transcript in one pass
+    transcript_data=$(extract_transcript_data "$transcript_path")
+    response=$(echo "$transcript_data" | jq -r '.response // empty')
+    usage_json=$(echo "$transcript_data" | jq -c '.usage // empty')
+    response_model=$(echo "$transcript_data" | jq -r '.model // empty')
 
-    logfire_msg="$hook_event"
-    [ -n "$response" ] && logfire_msg="${hook_event}: ${response:0:200}"
+    if [ "$hook_event" = "SubagentStop" ]; then
+      span_name="subagent response"
+    else
+      span_name="assistant response"
+    fi
 
     attrs="[$(make_attr "hook.event" "$hook_event")"
     attrs="$attrs,$(make_attr "session.id" "$session_id")"
-    attrs="$attrs,$(make_attr "logfire.msg" "$logfire_msg")"
+    attrs="$attrs,$(make_attr "logfire.msg" "$span_name")"
     attrs="$attrs,$(make_attr "logfire.span_type" "span")"
     [ -n "$response" ] && attrs="$attrs,$(make_attr "assistant.response" "$response")"
 
@@ -288,10 +459,62 @@ case "$hook_event" in
       [ -n "$agent_type" ] && attrs="$attrs,$(make_attr "agent.type" "$agent_type")"
     fi
 
+    # Add gen_ai and usage attributes if usage data is available
+    if [ -n "$usage_json" ] && [ "$usage_json" != "null" ] && [ "$usage_json" != '""' ]; then
+      # Standard OTel gen_ai semantic convention attributes
+      attrs="$attrs,$(make_attr "gen_ai.system" "anthropic")"
+      [ -n "$response_model" ] && attrs="$attrs,$(make_attr "gen_ai.response.model" "$response_model")"
+
+      input_tokens=$(echo "$usage_json" | jq -r '.input_tokens // empty')
+      output_tokens=$(echo "$usage_json" | jq -r '.output_tokens // empty')
+      cache_creation_input_tokens=$(echo "$usage_json" | jq -r '.cache_creation_input_tokens // empty')
+      cache_read_input_tokens=$(echo "$usage_json" | jq -r '.cache_read_input_tokens // empty')
+      service_tier=$(echo "$usage_json" | jq -r '.service_tier // empty')
+      inference_geo=$(echo "$usage_json" | jq -r '.inference_geo // empty')
+      cache_ephemeral_5m=$(echo "$usage_json" | jq -r '.cache_creation.ephemeral_5m_input_tokens // empty')
+      cache_ephemeral_1h=$(echo "$usage_json" | jq -r '.cache_creation.ephemeral_1h_input_tokens // empty')
+
+      # gen_ai.usage.* (standard OTel semconv — triggers Logfire token badges)
+      [ -n "$input_tokens" ] && attrs="$attrs,$(make_int_attr "gen_ai.usage.input_tokens" "$input_tokens")"
+      [ -n "$output_tokens" ] && attrs="$attrs,$(make_int_attr "gen_ai.usage.output_tokens" "$output_tokens")"
+
+      # All raw usage fields from the Anthropic API
+      [ -n "$input_tokens" ] && attrs="$attrs,$(make_int_attr "usage.input_tokens" "$input_tokens")"
+      [ -n "$output_tokens" ] && attrs="$attrs,$(make_int_attr "usage.output_tokens" "$output_tokens")"
+      [ -n "$cache_creation_input_tokens" ] && attrs="$attrs,$(make_int_attr "usage.cache_creation_input_tokens" "$cache_creation_input_tokens")"
+      [ -n "$cache_read_input_tokens" ] && attrs="$attrs,$(make_int_attr "usage.cache_read_input_tokens" "$cache_read_input_tokens")"
+      [ -n "$service_tier" ] && attrs="$attrs,$(make_attr "usage.service_tier" "$service_tier")"
+      [ -n "$inference_geo" ] && attrs="$attrs,$(make_attr "usage.inference_geo" "$inference_geo")"
+      [ -n "$cache_ephemeral_5m" ] && attrs="$attrs,$(make_int_attr "usage.cache_creation.ephemeral_5m_input_tokens" "$cache_ephemeral_5m")"
+      [ -n "$cache_ephemeral_1h" ] && attrs="$attrs,$(make_int_attr "usage.cache_creation.ephemeral_1h_input_tokens" "$cache_ephemeral_1h")"
+
+      # Calculate operation.cost (USD) for Logfire pricing display
+      if [ -n "$input_tokens" ] && [ -n "$output_tokens" ]; then
+        input_price=0
+        output_price=0
+        case "${response_model:-}" in
+          *opus*)   input_price="0.000015";  output_price="0.000075" ;;
+          *sonnet*) input_price="0.000003";  output_price="0.000015" ;;
+          *haiku*)  input_price="0.0000008"; output_price="0.000004" ;;
+        esac
+        if [ "$input_price" != "0" ]; then
+          cost=$(jq -n \
+            --argjson input "${input_tokens:-0}" \
+            --argjson output "${output_tokens:-0}" \
+            --argjson cache_create "${cache_creation_input_tokens:-0}" \
+            --argjson cache_read "${cache_read_input_tokens:-0}" \
+            --argjson ip "$input_price" \
+            --argjson op "$output_price" \
+            '($input * $ip) + ($cache_create * $ip * 1.25) + ($cache_read * $ip * 0.1) + ($output * $op)' 2>/dev/null)
+          [ -n "$cost" ] && [ "$cost" != "null" ] && attrs="$attrs,$(make_double_attr "operation.cost" "$cost")"
+        fi
+      fi
+    fi
+
     attrs="$attrs]"
 
     span_id=$(random_span_id)
-    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "$hook_event" "$ts_nano" "$ts_nano" "$attrs")
+    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "$span_name" "$ts_nano" "$ts_nano" "$attrs")
     send_otlp "$payload"
     ;;
 
@@ -301,8 +524,8 @@ case "$hook_event" in
     tool_use_id=$(echo "$input" | jq -r '.tool_use_id // empty')
     tool_input=$(echo "$input" | jq -c '.tool_input // empty')
 
-    logfire_msg="PreToolUse"
-    [ -n "$tool_name" ] && logfire_msg="PreToolUse: ${tool_name}"
+    logfire_msg="tool call"
+    [ -n "$tool_name" ] && logfire_msg="tool call: ${tool_name}"
 
     attrs="[$(make_attr "hook.event" "$hook_event")"
     attrs="$attrs,$(make_attr "session.id" "$session_id")"
@@ -314,7 +537,7 @@ case "$hook_event" in
     attrs="$attrs]"
 
     span_id=$(random_span_id)
-    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "PreToolUse" "$ts_nano" "$ts_nano" "$attrs")
+    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "$logfire_msg" "$ts_nano" "$ts_nano" "$attrs")
     send_otlp "$payload"
     ;;
 
@@ -326,8 +549,8 @@ case "$hook_event" in
     # Truncate tool_response to 10k chars to avoid huge payloads
     tool_response=$(echo "$input" | jq -c '.tool_response // empty' | head -c 10000)
 
-    logfire_msg="PostToolUse"
-    [ -n "$tool_name" ] && logfire_msg="PostToolUse: ${tool_name}"
+    logfire_msg="tool result"
+    [ -n "$tool_name" ] && logfire_msg="tool result: ${tool_name}"
 
     attrs="[$(make_attr "hook.event" "$hook_event")"
     attrs="$attrs,$(make_attr "session.id" "$session_id")"
@@ -340,7 +563,7 @@ case "$hook_event" in
     attrs="$attrs]"
 
     span_id=$(random_span_id)
-    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "PostToolUse" "$ts_nano" "$ts_nano" "$attrs")
+    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "$logfire_msg" "$ts_nano" "$ts_nano" "$attrs")
     send_otlp "$payload"
     ;;
 
@@ -349,23 +572,21 @@ case "$hook_event" in
     message=$(echo "$input" | jq -r '.message // empty')
     notification_type=$(echo "$input" | jq -r '.notification_type // empty')
 
-    logfire_msg="Notification"
-    [ -n "$message" ] && logfire_msg="Notification: ${message:0:200}"
-
     attrs="[$(make_attr "hook.event" "$hook_event")"
     attrs="$attrs,$(make_attr "session.id" "$session_id")"
-    attrs="$attrs,$(make_attr "logfire.msg" "$logfire_msg")"
+    attrs="$attrs,$(make_attr "logfire.msg" "notification")"
     attrs="$attrs,$(make_attr "logfire.span_type" "span")"
     [ -n "$message" ] && attrs="$attrs,$(make_attr "notification.message" "$message")"
     [ -n "$notification_type" ] && attrs="$attrs,$(make_attr "notification.type" "$notification_type")"
     attrs="$attrs]"
 
     span_id=$(random_span_id)
-    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "Notification" "$ts_nano" "$ts_nano" "$attrs")
+    payload=$(build_otlp_payload "$trace_id" "$span_id" "$root_span_id" "notification" "$ts_nano" "$ts_nano" "$attrs")
     send_otlp "$payload"
     ;;
 
   *)
+    log_diag "info" "Unrecognized hook event, sending generic span" "$hook_event"
     root_span_id=$(read_root_span_id)
 
     attrs="[$(make_attr "hook.event" "$hook_event")"

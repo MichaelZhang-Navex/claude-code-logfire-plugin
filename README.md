@@ -1,29 +1,41 @@
-# logfire-session-capture
+# Logfire plugin for Claude Code
 
-Claude Code plugin that captures all session events as OpenTelemetry traces sent to [Pydantic Logfire](https://logfire.pydantic.dev). Each session becomes a trace, each hook event becomes a child span. Local JSONL logging is always active as a fallback.
+A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that sends OpenTelemetry traces to [Pydantic Logfire](https://logfire.pydantic.dev), giving you full observability into your Claude Code sessions.
 
-## Setup
+Each session becomes a trace with child spans per LLM API call, with full token usage, cost tracking, and conversation history visible in Logfire.
 
-### Prerequisites
+<!-- TODO: add Logfire screenshot here -->
 
-- `jq` must be installed (`brew install jq` / `apt install jq`)
-- `curl` (pre-installed on macOS/Linux)
+## Installation
+
+### System requirements
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
+- A [Logfire](https://logfire.pydantic.dev) project with a write token
+- `jq` — JSON processing (`brew install jq` on macOS, `apt install jq` on Linux)
+- `curl` — sends OTLP/HTTP traces to Logfire
+- `xxd` — generates random span IDs (pre-installed on macOS; `apt install xxd` on Linux)
+- `shasum` — derives deterministic trace IDs (pre-installed on macOS; part of `perl` on Linux)
+- `python3` — optional, used for nanosecond-precision timestamps and ISO date conversion; falls back to second-precision if unavailable
 
 ### Install the plugin
 
-```bash
-claude plugin add /path/to/logfire-session-capture
+From within Claude Code, run:
+
+```
+/plugin marketplace add pydantic/claude-code-logfire-plugin
+/plugin install logfire-session-capture@pydantic-claude-code-logfire-plugin
 ```
 
-### Configure Logfire
-
-Set your Logfire write token to enable trace export:
+### Set your Logfire token
 
 ```bash
 export LOGFIRE_TOKEN="your-logfire-write-token"
 ```
 
-For the EU region, also set:
+Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.) so it persists across sessions.
+
+For the EU region:
 
 ```bash
 export LOGFIRE_BASE_URL="https://logfire-eu.pydantic.dev"
@@ -31,59 +43,52 @@ export LOGFIRE_BASE_URL="https://logfire-eu.pydantic.dev"
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `LOGFIRE_TOKEN` | Yes | _(none, OTel disabled)_ | Logfire write token |
+| `LOGFIRE_TOKEN` | Yes | _(none)_ | Logfire write token |
 | `LOGFIRE_BASE_URL` | No | `https://logfire-us.pydantic.dev` | Logfire ingest endpoint |
+| `LOGFIRE_LOCAL_LOG` | No | `false` | Set to `true` to write JSONL event logs locally |
 
-If `LOGFIRE_TOKEN` is not set, the plugin only writes JSONL locally with zero network overhead.
+Without `LOGFIRE_TOKEN`, no traces are sent. The plugin does nothing unless at least one of `LOGFIRE_TOKEN` or `LOGFIRE_LOCAL_LOG` is set.
 
-## Trace Structure
+## What you get
 
-Each Claude Code session produces one trace in Logfire:
+Every Claude Code session produces a trace in Logfire:
 
 ```
-Trace (trace_id derived from session_id)
-  └── Root span: "claude-code-session" (start=SessionStart, end=SessionEnd)
-        ├── Span: "SessionStart"
-        ├── Span: "UserPromptSubmit"
-        ├── Span: "PreToolUse" (tool.name=Read)
-        ├── Span: "PostToolUse" (tool.name=Read)
-        ├── Span: "Stop"
-        └── ...
+Claude Code session              <- root span (the full session)
+├── chat claude-opus-4-6         <- LLM API call 1
+├── chat claude-opus-4-6         <- LLM API call 2
+└── chat claude-opus-4-6         <- LLM API call 3
 ```
 
-- **trace_id** is deterministically derived from `session_id` (SHA-256), so all spans from the same session are correlated without shared state.
-- **Root span** is sent at SessionEnd with its start time backdated to SessionStart. OTLP backends handle out-of-order arrival.
-- **Child spans** are sent immediately as each hook fires (point-in-time, start == end).
+Each `chat` child span includes:
 
-## Events Captured
+- **Token usage** (`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`)
+- **Cost** (`operation.cost` in USD)
+- **Messages** (`gen_ai.input.messages`, `gen_ai.output.messages`)
+- **Finish reason** (`gen_ai.response.finish_reasons`)
 
-| Event | Span Attributes |
-|-------|----------------|
-| SessionStart | session.cwd, session.model |
-| SessionEnd | session.end_reason |
-| UserPromptSubmit | _(structural only)_ |
-| PreToolUse | tool.name, tool.use_id |
-| PostToolUse | tool.name, tool.use_id |
-| Stop | _(structural only)_ |
-| SubagentStop | _(structural only)_ |
-| PreCompact | _(structural only)_ |
-| Notification | _(structural only)_ |
+The root span carries the full conversation, so you can inspect the entire session in Logfire's trace view.
 
-All spans include `hook.event`, `session.id`, `logfire.msg`, and `logfire.span_type` attributes.
+## Distributed tracing
 
-Full event payloads (tool inputs/outputs, user prompts) are written to the local JSONL log only, to avoid payload size and privacy concerns in the remote trace.
+If you call Claude Code from a Python application that already uses Logfire or OpenTelemetry, you can link the Claude Code session into your existing trace by passing a `TRACEPARENT` environment variable:
 
-## Local Log
-
-Events are always written as JSON Lines to `.claude/logs/session-events.jsonl` in the project directory:
-
-```json
-{"session_id":"abc123","hook_event_name":"UserPromptSubmit","user_prompt":"fix the bug","captured_at":"2026-02-12T10:30:00Z"}
+```bash
+TRACEPARENT="00-<trace_id>-<parent_span_id>-01" claude --print "your prompt"
 ```
 
-## Error Handling
+See [`examples/distributed-tracing.py`](examples/distributed-tracing.py) for a complete example using `logfire` and `subprocess`.
 
-- **Logfire unreachable**: `curl` has a 5-second timeout; failures are silently ignored.
-- **SessionEnd never fires**: Child spans are still linked by trace ID; the orphaned temp file is cleaned by the OS.
-- **No LOGFIRE_TOKEN**: Script exits after JSONL write with zero network overhead.
-- **macOS nanoseconds**: Falls back to second-precision timestamps if `date +%N` is unavailable.
+## Local JSONL log
+
+Set `LOGFIRE_LOCAL_LOG=true` to write all hook events as JSON Lines to `.claude/logs/session-events.jsonl` in the project directory. This is off by default.
+
+## How it works
+
+The plugin is a single bash script ([`scripts/log-event.sh`](scripts/log-event.sh)) invoked by Claude Code hooks on every session event. On `Stop` events it parses the transcript file to extract per-API-call data (deduplicating streaming fragments) and sends OTLP/HTTP JSON to Logfire. On `SessionEnd` it sends the root span with the accumulated conversation.
+
+State is persisted in a temp file between hook invocations. The `trace_id` is deterministically derived from `session_id` via SHA-256.
+
+## License
+
+MIT

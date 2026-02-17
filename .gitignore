@@ -1,6 +1,7 @@
 .claude/logs/
 .claude/settings.local.json
 .env
+.venv/
 __pycache__/
 *.pyc
 tmp

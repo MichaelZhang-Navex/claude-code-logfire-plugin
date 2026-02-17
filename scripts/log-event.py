@@ -47,6 +47,7 @@ _diag_log: str | None = None
 # Diagnostics
 # ---------------------------------------------------------------------------
 
+
 def log_diag(level: str, msg: str, detail: str | None = None) -> None:
     if not _diag_log:
         return
@@ -69,6 +70,7 @@ def log_diag(level: str, msg: str, detail: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def now_nano() -> int:
     return time.time_ns()
@@ -94,6 +96,7 @@ def iso_to_nano(iso_str: str) -> int | None:
 # OTLP construction
 # ---------------------------------------------------------------------------
 
+
 def to_otlp_anyvalue(val: object) -> dict:
     """Recursively convert a Python value to OTLP AnyValue."""
     if isinstance(val, bool):
@@ -109,14 +112,7 @@ def to_otlp_anyvalue(val: object) -> dict:
     if isinstance(val, list):
         return {"arrayValue": {"values": [to_otlp_anyvalue(v) for v in val]}}
     if isinstance(val, dict):
-        return {
-            "kvlistValue": {
-                "values": [
-                    {"key": k, "value": to_otlp_anyvalue(v)}
-                    for k, v in val.items()
-                ]
-            }
-        }
+        return {"kvlistValue": {"values": [{"key": k, "value": to_otlp_anyvalue(v)} for k, v in val.items()]}}
     return {"stringValue": str(val)}
 
 
@@ -210,6 +206,7 @@ def send_otlp(payload: dict, endpoint: str, token: str) -> None:
 # Cost calculation
 # ---------------------------------------------------------------------------
 
+
 def get_model_prices(model: str) -> tuple[float, float] | None:
     for key, prices in MODEL_PRICING.items():
         if key in model:
@@ -260,6 +257,7 @@ def build_cost_details(
 # ---------------------------------------------------------------------------
 # State management
 # ---------------------------------------------------------------------------
+
 
 def read_state(state_file: str) -> dict | None:
     try:
@@ -314,6 +312,7 @@ def release_lock(lock_dir: str) -> None:
 # Transcript parsing
 # ---------------------------------------------------------------------------
 
+
 def _infer_finish_reason(assistant_msg: dict) -> str:
     stop_reason = assistant_msg.get("message", {}).get("stop_reason")
     if stop_reason == "end_turn":
@@ -346,12 +345,14 @@ def _convert_input_message(line: dict) -> dict:
                         result_content = json.loads(result_content)
                     except (json.JSONDecodeError, TypeError):
                         pass
-                parts.append({
-                    "type": "tool_call_response",
-                    "id": block.get("tool_use_id"),
-                    "name": block.get("name"),
-                    "result": result_content,
-                })
+                parts.append(
+                    {
+                        "type": "tool_call_response",
+                        "id": block.get("tool_use_id"),
+                        "name": block.get("name"),
+                        "result": result_content,
+                    }
+                )
             elif block.get("type") == "text":
                 parts.append({"type": "text", "content": block.get("text") or block.get("content", "")})
             else:
@@ -375,12 +376,14 @@ def _convert_output_message(line: dict) -> dict:
         elif btype == "thinking":
             parts.append({"type": "thinking", "thinking": block.get("thinking", "")})
         elif btype == "tool_use":
-            parts.append({
-                "type": "tool_call",
-                "id": block.get("id"),
-                "name": block.get("name"),
-                "arguments": json.dumps(block.get("input", {})),
-            })
+            parts.append(
+                {
+                    "type": "tool_call",
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "arguments": json.dumps(block.get("input", {})),
+                }
+            )
     return {"role": "assistant", "parts": parts, "finish_reason": finish_reason}
 
 
@@ -397,10 +400,7 @@ def _merge_assistant_content(base: dict, new: dict) -> None:
     base_content = base_msg.setdefault("content", [])
     new_content = new.get("message", {}).get("content", [])
 
-    seen_tool_ids = {
-        b["id"] for b in base_content
-        if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
-    }
+    seen_tool_ids = {b["id"] for b in base_content if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b}
 
     for block in new_content:
         if not isinstance(block, dict):
@@ -474,26 +474,26 @@ def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple
                 continue
 
         # Keep only user and assistant lines
-        relevant = [l for l in parsed if l.get("type") in ("user", "assistant")]
+        relevant = [line for line in parsed if line.get("type") in ("user", "assistant")]
 
         # Merge assistant streaming fragments by message.id.
         # Claude Code writes each content block as a separate fragment,
         # so we must collect all blocks to reconstruct the full message.
         seen: dict[str, dict] = {}
         order: list[str] = []
-        for l in relevant:
-            if l.get("type") == "assistant":
-                key = l.get("message", {}).get("id") or l.get("uuid", id(l))
+        for line in relevant:
+            if line.get("type") == "assistant":
+                key = line.get("message", {}).get("id") or line.get("uuid", id(line))
             else:
-                key = l.get("uuid", id(l))
+                key = line.get("uuid", id(line))
             key = str(key)
             if key not in seen:
                 order.append(key)
-                seen[key] = l
-            elif l.get("type") == "assistant":
-                _merge_assistant_content(seen[key], l)
+                seen[key] = line
+            elif line.get("type") == "assistant":
+                _merge_assistant_content(seen[key], line)
             else:
-                seen[key] = l
+                seen[key] = line
         deduped = [seen[k] for k in order]
 
         # Sort by timestamp
@@ -501,7 +501,7 @@ def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple
 
         # Group into API calls: each assistant message defines a call boundary,
         # preceded by any user messages since the last assistant.
-        assistants = [l for l in deduped if l.get("type") == "assistant"]
+        assistants = [line for line in deduped if line.get("type") == "assistant"]
         if not assistants:
             if attempt < max_attempts:
                 time.sleep(retry_delay)
@@ -511,25 +511,27 @@ def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple
         api_calls = []
         current_users: list[dict] = []
         prev_assistant_msg: dict | None = None
-        for l in deduped:
-            if l.get("type") == "user":
-                current_users.append(l)
-            elif l.get("type") == "assistant":
-                asst = l
+        for entry in deduped:
+            if entry.get("type") == "user":
+                current_users.append(entry)
+            elif entry.get("type") == "assistant":
+                asst = entry
                 call_model = asst.get("message", {}).get("model", "")
                 usage = asst.get("message", {}).get("usage", {})
                 input_msgs = []
                 if prev_assistant_msg is not None:
                     input_msgs.append(_convert_output_message(prev_assistant_msg))
                 input_msgs.extend(_convert_input_message(u) for u in current_users)
-                api_calls.append({
-                    "model": call_model,
-                    "timestamp": asst.get("timestamp", ""),
-                    "stop_reason": _infer_finish_reason(asst),
-                    "usage": usage,
-                    "input_messages": input_msgs,
-                    "output_messages": [_convert_output_message(asst)],
-                })
+                api_calls.append(
+                    {
+                        "model": call_model,
+                        "timestamp": asst.get("timestamp", ""),
+                        "stop_reason": _infer_finish_reason(asst),
+                        "usage": usage,
+                        "input_messages": input_msgs,
+                        "output_messages": [_convert_output_message(asst)],
+                    }
+                )
                 prev_assistant_msg = asst
                 current_users = []
 
@@ -545,6 +547,7 @@ def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple
 # ---------------------------------------------------------------------------
 # Shared span builder (eliminates Stop/SessionEnd duplication)
 # ---------------------------------------------------------------------------
+
 
 def _describe_call(input_messages: list[dict]) -> str:
     """Derive a short description from a call's input messages.
@@ -674,6 +677,7 @@ def build_child_spans_from_calls(
 # Event handlers
 # ---------------------------------------------------------------------------
 
+
 def handle_session_start(
     inp: dict,
     state_file: str,
@@ -746,8 +750,13 @@ def handle_session_start(
             attrs.append(make_attr("session.cwd", cwd))
 
         span = build_span(
-            trace_id, pending_span_id, root_span_id,
-            "Claude Code session", ts_nano, ts_nano, attrs,
+            trace_id,
+            pending_span_id,
+            root_span_id,
+            "Claude Code session",
+            ts_nano,
+            ts_nano,
+            attrs,
         )
         payload = build_otlp_envelope([span])
         send_otlp(payload, otlp_endpoint, logfire_token)
@@ -887,8 +896,13 @@ def handle_session_end(
         attrs.append(make_complex_attr("logfire.json_schema", json_schema))
 
         span = build_span(
-            trace_id, root_span_id, state_parent_span_id,
-            "Claude Code session", int(start_time), ts_nano, attrs,
+            trace_id,
+            root_span_id,
+            state_parent_span_id,
+            "Claude Code session",
+            int(start_time),
+            ts_nano,
+            attrs,
         )
         payload = build_otlp_envelope([span])
         send_otlp(payload, otlp_endpoint, logfire_token)
@@ -904,6 +918,7 @@ def handle_session_end(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     global _hook_event, _session_id, _diag_log
@@ -974,7 +989,9 @@ def main() -> None:
     if m:
         trace_id = m.group(1)
         parent_span_id_from_env = m.group(2)
-        log_diag("info", "Using trace context from TRACEPARENT", f"trace_id={trace_id} parent={parent_span_id_from_env}")
+        log_diag(
+            "info", "Using trace context from TRACEPARENT", f"trace_id={trace_id} parent={parent_span_id_from_env}"
+        )
 
     ts_nano = now_nano()
     transcript_path = inp.get("transcript_path", "")
@@ -984,11 +1001,24 @@ def main() -> None:
     lock_file = f"{state_file}.lock"
 
     if hook_event == "SessionStart":
-        handle_session_start(inp, state_file, lock_file, ts_nano, transcript_path, parent_span_id_from_env, trace_id, otlp_endpoint, logfire_token, session_id)
+        handle_session_start(
+            inp,
+            state_file,
+            lock_file,
+            ts_nano,
+            transcript_path,
+            parent_span_id_from_env,
+            trace_id,
+            otlp_endpoint,
+            logfire_token,
+            session_id,
+        )
     elif hook_event in ("Stop", "SubagentStop"):
         handle_stop(inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token)
     elif hook_event == "SessionEnd":
-        handle_session_end(inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, session_id)
+        handle_session_end(
+            inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, session_id
+        )
 
 
 if __name__ == "__main__":

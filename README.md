@@ -118,6 +118,14 @@ Diagnostic logs are written to `.claude/logs/diagnostics.jsonl` in the project d
 - **Export errors (HTTP 401/403)** -- Your Logfire token may be invalid or expired. Generate a new write token in the Logfire console.
 - **Export errors (HTTP 4xx/5xx)** -- Check `LOGFIRE_BASE_URL` if using a non-default region. The plugin logs HTTP status codes to stderr and diagnostics.
 
+## Development
+
+```bash
+uv sync
+uv run ruff check scripts/
+uv run ruff format scripts/
+```
+
 ## How it works
 
 The plugin is a single Python script ([`scripts/log-event.py`](scripts/log-event.py), stdlib only) invoked by Claude Code hooks on every session event. On `Stop` events it parses the transcript file to extract per-API-call data (deduplicating streaming fragments) and sends OTLP/HTTP JSON to Logfire. On `SessionEnd` it sends the root span with the accumulated conversation.

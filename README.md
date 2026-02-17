@@ -23,6 +23,12 @@ From within Claude Code, run:
 /plugin install logfire-session-capture@pydantic-claude-code-logfire-plugin
 ```
 
+### Update the plugin
+
+```
+/plugin update logfire-session-capture@pydantic-claude-code-logfire-plugin
+```
+
 ### Set your Logfire token
 
 ```bash

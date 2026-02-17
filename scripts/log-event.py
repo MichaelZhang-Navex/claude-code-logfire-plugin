@@ -496,9 +496,6 @@ def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple
                 seen[key] = line
         deduped = [seen[k] for k in order]
 
-        # Sort by timestamp
-        deduped.sort(key=lambda x: x.get("timestamp", ""))
-
         # Group into API calls: each assistant message defines a call boundary,
         # preceded by any user messages since the last assistant.
         assistants = [line for line in deduped if line.get("type") == "assistant"]

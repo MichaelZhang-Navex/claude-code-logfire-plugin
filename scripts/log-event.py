@@ -35,6 +35,50 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     "haiku": (0.0000008, 0.000004),
 }
 
+TOOL_CATEGORIES: dict[str, str] = {
+    "Read": "file_ops",
+    "Write": "file_ops",
+    "Edit": "file_ops",
+    "MultiEdit": "file_ops",
+    "NotebookRead": "file_ops",
+    "NotebookEdit": "file_ops",
+    "Glob": "search",
+    "Grep": "search",
+    "LS": "search",
+    "ToolSearch": "search",
+    "Bash": "execution",
+    "WebSearch": "web",
+    "WebFetch": "web",
+    "Task": "agent",
+    "Skill": "skill",
+    "TodoRead": "planning",
+    "TodoWrite": "planning",
+    "TaskCreate": "planning",
+    "TaskUpdate": "planning",
+    "TaskList": "planning",
+    "TaskGet": "planning",
+    "EnterPlanMode": "planning",
+    "ExitPlanMode": "planning",
+    "AskUserQuestion": "interaction",
+}
+
+
+def categorize_tool(name: str) -> str:
+    if name in TOOL_CATEGORIES:
+        return TOOL_CATEGORIES[name]
+    if name.startswith("mcp__"):
+        return "mcp"
+    return "other"
+
+
+def format_tool_name(name: str) -> str:
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            return f"{parts[1]}/{parts[2]}"
+    return name
+
+
 # ---------------------------------------------------------------------------
 # Globals set once in main()
 # ---------------------------------------------------------------------------
@@ -546,33 +590,115 @@ def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple
 # ---------------------------------------------------------------------------
 
 
-def _describe_call(input_messages: list[dict]) -> str:
-    """Derive a short description from a call's input messages.
+def _extract_tools_from_messages(messages: list[dict]) -> tuple[list[str], str | None, list[str], dict[str, int]]:
+    """Extract tool names, skill name, and categories from message parts.
 
-    Looks at what initiated this turn. The prepended previous assistant
-    message carries tool_call parts with names; if present, this turn is
-    processing those tool results. Otherwise it's a 'response' to user text.
+    Returns (display_tool_names, skill_name_or_none, unique_categories, tool_counts).
+    tool_counts maps display name -> total invocation count (not deduplicated).
     """
-    tool_names: list[str] = []
-    has_tool_results = False
-    has_user_input = False
-    for msg in input_messages:
-        if msg.get("role") == "user":
-            has_user_input = True
+    raw_names: list[str] = []
+    tool_counts: dict[str, int] = {}
+    skill_name: str | None = None
+
+    for msg in messages:
         for part in msg.get("parts", []):
-            if part.get("type") == "tool_call":
-                name = part.get("name", "")
-                if name and name not in tool_names:
-                    tool_names.append(name)
-            elif part.get("type") == "tool_call_response":
-                has_tool_results = True
-    if tool_names:
-        return "Tool: " + ", ".join(tool_names)
+            if part.get("type") != "tool_call":
+                continue
+            name = part.get("name", "")
+            if not name:
+                continue
+
+            display = format_tool_name(name)
+            tool_counts[display] = tool_counts.get(display, 0) + 1
+
+            if name in raw_names:
+                continue
+            raw_names.append(name)
+
+            if name == "Skill":
+                args_str = part.get("arguments", "{}")
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    skill_name = args.get("skill")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+    display_names = [format_tool_name(n) for n in raw_names]
+    categories = list(dict.fromkeys(categorize_tool(n) for n in raw_names))
+    return display_names, skill_name, categories, tool_counts
+
+
+def _has_thinking(messages: list[dict]) -> bool:
+    """Check if any message contains a thinking block."""
+    return any(
+        p.get("type") == "thinking"
+        for msg in messages
+        for p in msg.get("parts", [])
+    )
+
+
+def _extract_user_snippet(input_messages: list[dict], max_len: int = 60) -> str | None:
+    """Extract a short snippet of the user's question from input messages."""
+    for msg in input_messages:
+        if msg.get("role") != "user":
+            continue
+        for part in msg.get("parts", []):
+            if part.get("type") == "text":
+                text = (part.get("content") or part.get("text") or "").strip()
+                if not text:
+                    continue
+                first_line = text.split("\n", 1)[0].strip()
+                if len(first_line) > max_len:
+                    return first_line[:max_len] + "..."
+                return first_line
+    return None
+
+
+def _describe_call(input_messages: list[dict], output_messages: list[dict]) -> str:
+    """Derive a descriptive label from a call's input and output messages."""
+    out_tools, skill_name, _, _ = _extract_tools_from_messages(output_messages)
+    in_tools, _, _, _ = _extract_tools_from_messages(input_messages)
+    thinking = _has_thinking(output_messages)
+
+    if skill_name:
+        other_tools = [t for t in out_tools if t != "Skill"]
+        if other_tools:
+            return f"Skill: {skill_name} (+{len(other_tools)} tools)"
+        return f"Skill: {skill_name}"
+
+    user_snippet = _extract_user_snippet(input_messages)
+    has_tool_results = any(
+        p.get("type") == "tool_call_response"
+        for msg in input_messages
+        for p in msg.get("parts", [])
+    )
+
+    thinking_prefix = "Thinking + " if thinking else ""
+
+    if user_snippet:
+        if out_tools:
+            tool_summary = ", ".join(out_tools[:3])
+            if len(out_tools) > 3:
+                tool_summary += f" +{len(out_tools) - 3} more"
+            return f"User: {user_snippet} -> {thinking_prefix}{tool_summary}"
+        return f"User: {user_snippet} -> {thinking_prefix}Response"
+
+    if out_tools:
+        tool_summary = ", ".join(out_tools[:3])
+        if len(out_tools) > 3:
+            tool_summary += f" +{len(out_tools) - 3} more"
+        if has_tool_results:
+            return f"{thinking_prefix}{tool_summary} (processing tool results)"
+        return f"{thinking_prefix}{tool_summary}"
+
     if has_tool_results:
-        return "tool result"
-    if has_user_input:
-        return "User input"
-    return "response"
+        if in_tools:
+            tool_summary = ", ".join(in_tools[:3])
+            if len(in_tools) > 3:
+                tool_summary += f" +{len(in_tools) - 3} more"
+            return f"{thinking_prefix}Response (after {tool_summary})"
+        return f"{thinking_prefix}Response (after tools)"
+    return f"{thinking_prefix}Response" if thinking else "Response"
 
 
 def build_child_spans_from_calls(
@@ -581,10 +707,11 @@ def build_child_spans_from_calls(
     root_span_id: str,
     model_default: str,
     ts_nano: int,
-) -> tuple[list[dict], list[dict], list[dict], dict]:
+    subagent_type: str = "",
+) -> tuple[list[dict], list[dict], list[dict], dict, dict]:
     """Build child spans and accumulate state from API calls.
 
-    Returns (spans, new_messages, new_cost_details, usage_deltas).
+    Returns (spans, new_messages, new_cost_details, usage_deltas, tools_meta).
     """
     spans = []
     new_messages: list[dict] = []
@@ -595,6 +722,7 @@ def build_child_spans_from_calls(
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
     }
+    tools_meta: dict = {"tools_used": {}, "categories": [], "skills": []}
 
     for call in api_calls:
         call_model = call.get("model") or model_default
@@ -620,8 +748,6 @@ def build_child_spans_from_calls(
 
         call_input_msgs = call.get("input_messages", [])
         call_output_msgs = call.get("output_messages", [])
-        # Only add user-role messages from input to all_messages;
-        # the previous assistant message is already present as output of the prior call
         for msg in call_input_msgs:
             if msg.get("role") == "user":
                 new_messages.append(msg)
@@ -635,7 +761,25 @@ def build_child_spans_from_calls(
                 call_ns = parsed_ns
 
         span_id = random_span_id()
-        logfire_msg = _describe_call(call_input_msgs)
+        out_tools, skill_name, categories, tool_counts = _extract_tools_from_messages(call_output_msgs)
+
+        # Accumulate tools metadata across all calls (using raw counts)
+        for tool_name, count in tool_counts.items():
+            tools_meta["tools_used"][tool_name] = tools_meta["tools_used"].get(tool_name, 0) + count
+        for cat in categories:
+            if cat not in tools_meta["categories"]:
+                tools_meta["categories"].append(cat)
+        if skill_name and skill_name not in tools_meta["skills"]:
+            tools_meta["skills"].append(skill_name)
+
+        if subagent_type:
+            snippet = _extract_user_snippet(call_input_msgs)
+            if snippet:
+                logfire_msg = f"User: {snippet} -> Subagent: {subagent_type}"
+            else:
+                logfire_msg = f"Subagent: {subagent_type}"
+        else:
+            logfire_msg = _describe_call(call_input_msgs, call_output_msgs)
         span_name = f"chat {call_model}"
 
         attrs = [
@@ -655,19 +799,31 @@ def build_child_spans_from_calls(
         if cost is not None:
             attrs.append(make_double_attr("operation.cost", cost))
 
-        json_schema = {
+        if out_tools:
+            attrs.append(make_complex_attr("claude_code.tools_used", out_tools))
+        if categories:
+            attrs.append(make_complex_attr("claude_code.tool_categories", categories))
+        if skill_name:
+            attrs.append(make_attr("claude_code.skill", skill_name))
+        if subagent_type:
+            attrs.append(make_attr("claude_code.subagent_type", subagent_type))
+
+        json_schema: dict = {
             "type": "object",
             "properties": {
                 "gen_ai.input.messages": {"type": "array"},
                 "gen_ai.output.messages": {"type": "array"},
             },
         }
+        if out_tools:
+            json_schema["properties"]["claude_code.tools_used"] = {"type": "array"}
+            json_schema["properties"]["claude_code.tool_categories"] = {"type": "array"}
         attrs.append(make_complex_attr("logfire.json_schema", json_schema))
 
         span = build_span(trace_id, span_id, root_span_id, span_name, call_ns, call_ns, attrs)
         spans.append(span)
 
-    return spans, new_messages, new_cost_details, usage_deltas
+    return spans, new_messages, new_cost_details, usage_deltas, tools_meta
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +882,7 @@ def handle_session_start(
             },
             "cost_details": [],
             "all_messages": [],
+            "tools_meta": {"tools_used": {}, "categories": [], "skills": []},
         }
         write_state(state_file, state)
 
@@ -761,6 +918,19 @@ def handle_session_start(
         release_lock(lock_file)
 
 
+def _merge_tools_meta(state: dict, new_meta: dict) -> None:
+    """Merge new tools_meta into state's accumulated tools_meta."""
+    meta = state.setdefault("tools_meta", {"tools_used": {}, "categories": [], "skills": []})
+    for tool_name, count in new_meta.get("tools_used", {}).items():
+        meta["tools_used"][tool_name] = meta["tools_used"].get(tool_name, 0) + count
+    for cat in new_meta.get("categories", []):
+        if cat not in meta["categories"]:
+            meta["categories"].append(cat)
+    for skill in new_meta.get("skills", []):
+        if skill not in meta["skills"]:
+            meta["skills"].append(skill)
+
+
 def handle_stop(
     inp: dict,
     state_file: str,
@@ -770,6 +940,7 @@ def handle_stop(
     transcript_path: str,
     otlp_endpoint: str,
     logfire_token: str,
+    hook_event: str = "Stop",
 ) -> None:
     if not acquire_lock(lock_file):
         return
@@ -783,13 +954,17 @@ def handle_stop(
         last_line = state.get("last_line", 0)
         model_default = state.get("model", "")
 
+        subagent_type = ""
+        if hook_event == "SubagentStop":
+            subagent_type = inp.get("agent_type", "unknown")
+
         api_calls, new_total = parse_transcript_slice(transcript_path, last_line)
         if not api_calls:
             log_diag("info", "No API calls found in transcript slice")
             return
 
-        spans, new_messages, new_cost_details, usage_deltas = build_child_spans_from_calls(
-            api_calls, trace_id, root_span_id, model_default, ts_nano
+        spans, new_messages, new_cost_details, usage_deltas, tools_meta = build_child_spans_from_calls(
+            api_calls, trace_id, root_span_id, model_default, ts_nano, subagent_type=subagent_type
         )
 
         if spans:
@@ -803,6 +978,7 @@ def handle_stop(
         state["cost_details"] = state.get("cost_details", []) + new_cost_details
         for k, v in usage_deltas.items():
             state["usage"][k] = state["usage"].get(k, 0) + v
+        _merge_tools_meta(state, tools_meta)
         write_state(state_file, state)
     finally:
         release_lock(lock_file)
@@ -840,7 +1016,7 @@ def handle_session_end(
         if final_tp and os.path.isfile(final_tp):
             remaining_calls, new_total = parse_transcript_slice(final_tp, last_line)
             if remaining_calls:
-                spans, new_msgs, new_costs, usage_deltas = build_child_spans_from_calls(
+                spans, new_msgs, new_costs, usage_deltas, tools_meta = build_child_spans_from_calls(
                     remaining_calls, trace_id, root_span_id, model, ts_nano
                 )
                 if spans:
@@ -852,6 +1028,7 @@ def handle_session_end(
                 state["cost_details"] = state.get("cost_details", []) + new_costs
                 for k, v in usage_deltas.items():
                     state["usage"][k] = state["usage"].get(k, 0) + v
+                _merge_tools_meta(state, tools_meta)
 
         all_messages = state.get("all_messages", [])
 
@@ -883,13 +1060,33 @@ def handle_session_end(
             attrs.append(make_complex_attr("final_result", final_result))
         attrs.append(make_complex_attr("pydantic_ai.all_messages", all_messages))
 
-        json_schema = {
+        # Aggregated tool metadata from all Stop events
+        meta = state.get("tools_meta", {})
+        tools_used_counts = [
+            {"tool": name, "count": count}
+            for name, count in meta.get("tools_used", {}).items()
+        ]
+        if tools_used_counts:
+            attrs.append(make_complex_attr("claude_code.tools_used", tools_used_counts))
+        agg_categories = meta.get("categories", [])
+        if agg_categories:
+            attrs.append(make_complex_attr("claude_code.tool_categories", agg_categories))
+        agg_skills = meta.get("skills", [])
+        if agg_skills:
+            attrs.append(make_complex_attr("claude_code.skills_used", agg_skills))
+
+        json_schema: dict = {
             "type": "object",
             "properties": {
                 "final_result": {"type": "object"},
                 "pydantic_ai.all_messages": {"type": "array"},
             },
         }
+        if tools_used_counts:
+            json_schema["properties"]["claude_code.tools_used"] = {"type": "array"}
+            json_schema["properties"]["claude_code.tool_categories"] = {"type": "array"}
+        if agg_skills:
+            json_schema["properties"]["claude_code.skills_used"] = {"type": "array"}
         attrs.append(make_complex_attr("logfire.json_schema", json_schema))
 
         span = build_span(
@@ -1011,7 +1208,7 @@ def main() -> None:
             session_id,
         )
     elif hook_event in ("Stop", "SubagentStop"):
-        handle_stop(inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token)
+        handle_stop(inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, hook_event)
     elif hook_event == "SessionEnd":
         handle_session_end(
             inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, session_id
